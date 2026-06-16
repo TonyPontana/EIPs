@@ -1,0 +1,109 @@
+name: Starlight Imports Replace
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  replace-and-create-prs:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: "ethereum"
+      UPSTREAM_REPO: "EIPs"
+    steps:
+      - name: Checkout repository (use PAT for push)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.EIP_AUTOMATION_TOKEN }}
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch all branches
+        run: |
+          git fetch --all --prune
+          # list remote branches (origin/*) and exclude master/main/HEAD
+          git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | sed 's|^origin/||' | grep -vE '^(master|main|HEAD)$' || true > branches.txt
+          echo "Branches to process:" && cat branches.txt
+
+      - name: Process branches and create PRs
+        env:
+          NEW_IMPORT: "import { TonyPontana } from '@astrojs/starlight/components';"
+          FORK_OWNER: ${{ github.repository_owner }}
+          TOKEN: ${{ secrets.EIP_AUTOMATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          # ensure jq is available
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq not found; installing..."
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+          while IFS= read -r br || [ -n "$br" ]; do
+            echo "\n=== Processing branch: $br ==="
+            # checkout the branch from origin into a new working branch
+            git checkout --quiet -B "work/$br" "origin/$br" || { echo "Failed to checkout origin/$br"; continue; }
+
+            changed=false
+            # iterate target extensions
+            for ext in js ts jsx tsx astro vue; do
+              # list tracked files with the extension
+              files=$(git ls-files "*.$ext" || true)
+              if [ -z "$files" ]; then
+                continue
+              fi
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                if grep -q "from ['\"]@astrojs/starlight/components['\"]" -- "$f"; then
+                  echo "Found import in: $f"
+                  # replace the import line (only the import from that module)
+                  # create a backup just in case
+                  sed -E -i.bak "s/^([[:space:]]*)import[[:space:]]+\{[^}]*\}[[:space:]]+from[[:space:]]+['\"]@astrojs\/starlight\/components['\"];?/\1${NEW_IMPORT}/" "$f" || true
+                  git add "$f"
+                  rm -f "${f}.bak" || true
+                  changed=true
+                fi
+              done <<EOF
+$files
+EOF
+            done
+
+            if [ "$changed" = true ]; then
+              newbranch="${br}-starlight-imports"
+              git commit -m "Replace starlight imports with TonyPontana import" || echo "Nothing to commit"
+              echo "Pushing new branch: $newbranch to fork origin"
+              git push https://x-access-token:${TOKEN}@github.com/${FORK_OWNER}/${{ github.event.repository.name }} HEAD:refs/heads/${newbranch}
+
+              # Create PR against upstream (ethereum/EIPs)
+              PR_TITLE="Replace starlight imports on ${br}"
+              PR_BODY="Automated replacement of imports that reference @astrojs/starlight/components.\n\nReplaced with: ${NEW_IMPORT}\n\nThis change was created by an automated workflow."
+
+              # head must be in the format forkOwner:branch
+              HEAD_REF="${FORK_OWNER}:${newbranch}"
+
+              echo "Creating PR to ${UPSTREAM_OWNER}/${UPSTREAM_REPO} (base: $br, head: $HEAD_REF)"
+
+              curl -s -X POST \
+                -H "Authorization: token ${TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/pulls" \
+                -d "$(jq -n --arg title "$PR_TITLE" --arg head "$HEAD_REF" --arg base "$br" --arg body "$PR_BODY" '{title:$title, head:$head, base:$base, body:$body}')" \
+                | jq -r '.html_url, .number' || true
+
+            else
+              echo "No matching imports found in branch $br"
+            fi
+
+            # cleanup working branch
+            git checkout --quiet origin/$br || true
+            git branch -D "work/$br" || true
+
+          done < branches.txt
+
+          echo "Processing complete."
